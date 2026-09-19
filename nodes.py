@@ -1,764 +1,1111 @@
-# mypy: allow-untyped-defs
-from __future__ import annotations
+"""
+blib2to3 Node/Leaf transformation-related utility functions.
+"""
 
-import abc
-from collections.abc import Callable
-from collections.abc import Iterable
 from collections.abc import Iterator
-from collections.abc import MutableMapping
-from functools import cached_property
-from functools import lru_cache
-import os
-import pathlib
-from pathlib import Path
-from typing import Any
-from typing import cast
-from typing import NoReturn
-from typing import overload
-from typing import TYPE_CHECKING
-from typing import TypeVar
-import warnings
+from typing import Final, Generic, Literal, TypeGuard, TypeVar, Union
 
-import pluggy
+from mypy_extensions import mypyc_attr
 
-import _pytest._code
-from _pytest._code import getfslineno
-from _pytest._code.code import ExceptionInfo
-from _pytest._code.code import TerminalRepr
-from _pytest._code.code import Traceback
-from _pytest._code.code import TracebackStyle
-from _pytest.compat import LEGACY_PATH
-from _pytest.compat import signature
-from _pytest.config import Config
-from _pytest.config import ConftestImportFailure
-from _pytest.mark.structures import Mark
-from _pytest.mark.structures import MarkDecorator
-from _pytest.mark.structures import NodeKeywords
-from _pytest.outcomes import fail
-from _pytest.pathlib import absolutepath
-from _pytest.stash import Stash
-from _pytest.warning_types import PytestWarning
+from black.cache import CACHE_DIR
+from black.mode import Mode, Preview
+from black.strings import get_string_prefix, has_triple_quotes
+from blib2to3 import pygram
+from blib2to3.pgen2 import token
+from blib2to3.pytree import NL, Leaf, Node, type_repr
+
+pygram.initialize(CACHE_DIR)
+syms: Final = pygram.python_symbols
 
 
-if TYPE_CHECKING:
-    from typing_extensions import Self
-
-    # Imported here due to circular import.
-    from _pytest.main import Session
-
-
-SEP = "/"
+# types
+T = TypeVar("T")
+LN = Union[Leaf, Node]
+LeafID = int
+NodeType = int
 
 
-def norm_sep(path: str | os.PathLike[str]) -> str:
-    """Normalize path separators to forward slashes for nodeid compatibility.
+WHITESPACE: Final = {token.DEDENT, token.INDENT, token.NEWLINE}
+STATEMENT: Final = {
+    syms.if_stmt,
+    syms.while_stmt,
+    syms.for_stmt,
+    syms.try_stmt,
+    syms.except_clause,
+    syms.with_stmt,
+    syms.funcdef,
+    syms.classdef,
+    syms.match_stmt,
+    syms.case_block,
+}
+STANDALONE_COMMENT: Final = 153
+token.tok_name[STANDALONE_COMMENT] = "STANDALONE_COMMENT"
+LOGIC_OPERATORS: Final = {"and", "or"}
+COMPARATORS: Final = {
+    token.LESS,
+    token.GREATER,
+    token.EQEQUAL,
+    token.NOTEQUAL,
+    token.LESSEQUAL,
+    token.GREATEREQUAL,
+}
+MATH_OPERATORS: Final = {
+    token.VBAR,
+    token.CIRCUMFLEX,
+    token.AMPER,
+    token.LEFTSHIFT,
+    token.RIGHTSHIFT,
+    token.PLUS,
+    token.MINUS,
+    token.STAR,
+    token.SLASH,
+    token.DOUBLESLASH,
+    token.PERCENT,
+    token.AT,
+    token.TILDE,
+    token.DOUBLESTAR,
+}
+STARS: Final = {token.STAR, token.DOUBLESTAR}
+VARARGS_SPECIALS: Final = STARS | {token.SLASH}
+VARARGS_PARENTS: Final = {
+    syms.arglist,
+    syms.argument,  # double star in arglist
+    syms.trailer,  # single argument to call
+    syms.typedargslist,
+    syms.varargslist,  # lambdas
+}
+UNPACKING_PARENTS: Final = {
+    syms.atom,  # single element of a list or set literal
+    syms.dictsetmaker,
+    syms.listmaker,
+    syms.testlist_gexp,
+    syms.testlist_star_expr,
+    syms.subject_expr,
+    syms.pattern,
+}
+TEST_DESCENDANTS: Final = {
+    syms.test,
+    syms.lambdef,
+    syms.or_test,
+    syms.and_test,
+    syms.not_test,
+    syms.comparison,
+    syms.star_expr,
+    syms.expr,
+    syms.xor_expr,
+    syms.and_expr,
+    syms.shift_expr,
+    syms.arith_expr,
+    syms.trailer,
+    syms.term,
+    syms.power,
+    syms.namedexpr_test,
+}
+TYPED_NAMES: Final = {syms.tname, syms.tname_star}
+ASSIGNMENTS: Final = {
+    "=",
+    "+=",
+    "-=",
+    "*=",
+    "@=",
+    "/=",
+    "%=",
+    "&=",
+    "|=",
+    "^=",
+    "<<=",
+    ">>=",
+    "**=",
+    "//=",
+    ":",
+}
 
-    Replaces backslashes with forward slashes. This handles both Windows native
-    paths and cross-platform data (e.g., Windows paths in serialized test reports
-    when running on Linux).
+IMPLICIT_TUPLE: Final = {syms.testlist, syms.testlist_star_expr, syms.exprlist}
+BRACKET: Final = {
+    token.LPAR: token.RPAR,
+    token.LSQB: token.RSQB,
+    token.LBRACE: token.RBRACE,
+}
+OPENING_BRACKETS: Final = set(BRACKET.keys())
+CLOSING_BRACKETS: Final = set(BRACKET.values())
+BRACKETS: Final = OPENING_BRACKETS | CLOSING_BRACKETS
+ALWAYS_NO_SPACE: Final = CLOSING_BRACKETS | {
+    token.COMMA,
+    STANDALONE_COMMENT,
+    token.FSTRING_MIDDLE,
+    token.FSTRING_END,
+    token.TSTRING_MIDDLE,
+    token.TSTRING_END,
+    token.BANG,
+}
 
-    :param path: A path string or PathLike object.
-    :returns: String with all backslashes replaced by forward slashes.
+RARROW = 55
+
+
+@mypyc_attr(allow_interpreted_subclasses=True)
+class Visitor(Generic[T]):
+    """Basic lib2to3 visitor that yields things of type `T` on `visit()`."""
+
+    def visit(self, node: LN) -> Iterator[T]:
+        """Main method to visit `node` and its children.
+
+        It tries to find a `visit_*()` method for the given `node.type`, like
+        `visit_simple_stmt` for Node objects or `visit_INDENT` for Leaf objects.
+        If no dedicated `visit_*()` method is found, chooses `visit_default()`
+        instead.
+
+        Then yields objects of type `T` from the selected visitor.
+        """
+        if node.type < 256:
+            name = token.tok_name[node.type]
+        else:
+            name = str(type_repr(node.type))
+        # We explicitly branch on whether a visitor exists (instead of
+        # using self.visit_default as the default arg to getattr) in order
+        # to save needing to create a bound method object and so mypyc can
+        # generate a native call to visit_default.
+        visitf = getattr(self, f"visit_{name}", None)
+        if visitf:
+            yield from visitf(node)
+        else:
+            yield from self.visit_default(node)
+
+    def visit_default(self, node: LN) -> Iterator[T]:
+        """Default `visit_*()` implementation. Recurses to children of `node`."""
+        if isinstance(node, Node):
+            for child in node.children:
+                yield from self.visit(child)
+
+
+def whitespace(leaf: Leaf, *, complex_subscript: bool, mode: Mode) -> str:
+    """Return whitespace prefix if needed for the given `leaf`.
+
+    `complex_subscript` signals whether the given leaf is part of a subscription
+    which has non-trivial arguments, like arithmetic expressions or function calls.
     """
-    return os.fspath(path).replace("\\", SEP)
-
-
-tracebackcutdir = Path(_pytest.__file__).parent
-
-
-_T = TypeVar("_T")
-
-
-_NodeType = TypeVar("_NodeType", bound="Node")
-
-
-class NodeMeta(abc.ABCMeta):
-    """Metaclass used by :class:`Node` to enforce that direct construction raises
-    :class:`Failed`.
-
-    This behaviour supports the indirection introduced with :meth:`Node.from_parent`,
-    the named constructor to be used instead of direct construction. The design
-    decision to enforce indirection with :class:`NodeMeta` was made as a
-    temporary aid for refactoring the collection tree, which was diagnosed to
-    have :class:`Node` objects whose creational patterns were overly entangled.
-    Once the refactoring is complete, this metaclass can be removed.
-
-    See https://github.com/pytest-dev/pytest/projects/3 for an overview of the
-    progress on detangling the :class:`Node` classes.
-    """
-
-    def __call__(cls, *k, **kw) -> NoReturn:
-        msg = (
-            "Direct construction of {name} has been deprecated, please use {name}.from_parent.\n"
-            "See "
-            "https://docs.pytest.org/en/stable/deprecations.html#node-construction-changed-to-node-from-parent"
-            " for more details."
-        ).format(name=f"{cls.__module__}.{cls.__name__}")
-        fail(msg, pytrace=False)
-
-    def _create(cls: type[_T], *k, **kw) -> _T:
-        try:
-            return super().__call__(*k, **kw)  # type: ignore[no-any-return,misc]
-        except TypeError:
-            sig = signature(getattr(cls, "__init__"))
-            known_kw = {k: v for k, v in kw.items() if k in sig.parameters}
-            from .warning_types import PytestDeprecationWarning
-
-            warnings.warn(
-                PytestDeprecationWarning(
-                    f"{cls} is not using a cooperative constructor and only takes {set(known_kw)}.\n"
-                    "See https://docs.pytest.org/en/stable/deprecations.html"
-                    "#constructors-of-custom-pytest-node-subclasses-should-take-kwargs "
-                    "for more details."
-                )
-            )
-
-            return super().__call__(*k, **known_kw)  # type: ignore[no-any-return,misc]
-
-
-class Node(abc.ABC, metaclass=NodeMeta):
-    r"""Base class of :class:`Collector` and :class:`Item`, the components of
-    the test collection tree.
-
-    ``Collector``\'s are the internal nodes of the tree, and ``Item``\'s are the
-    leaf nodes.
-    """
-
-    # Implemented in the legacypath plugin.
-    #: A ``LEGACY_PATH`` copy of the :attr:`path` attribute. Intended for usage
-    #: for methods not migrated to ``pathlib.Path`` yet, such as
-    #: :meth:`Item.reportinfo <pytest.Item.reportinfo>`. Will be deprecated in
-    #: a future release, prefer using :attr:`path` instead.
-    fspath: LEGACY_PATH
-
-    # Use __slots__ to make attribute access faster.
-    # Note that __dict__ is still available.
-    __slots__ = (
-        "__dict__",
-        "_nodeid",
-        "_store",
-        "config",
-        "name",
-        "parent",
-        "path",
-        "session",
-    )
-
-    def __init__(
-        self,
-        name: str,
-        parent: Node | None = None,
-        config: Config | None = None,
-        session: Session | None = None,
-        fspath: None = None,
-        path: Path | None = None,
-        nodeid: str | None = None,
-    ) -> None:
-        #: A unique name within the scope of the parent node.
-        self.name: str = name
-
-        #: The parent collector node.
-        self.parent = parent
-
-        if config:
-            #: The pytest config object.
-            self.config: Config = config
-        else:
-            if not parent:
-                raise TypeError("config or parent must be provided")
-            self.config = parent.config
-
-        if session:
-            #: The pytest session this node is part of.
-            self.session: Session = session
-        else:
-            if not parent:
-                raise TypeError("session or parent must be provided")
-            self.session = parent.session
-
-        if path is None:
-            assert parent is not None
-            path = parent.path
-        #: Filesystem path where this node was collected from.
-        self.path: pathlib.Path = path
-
-        # The explicit annotation is to avoid publicly exposing NodeKeywords.
-        #: Keywords/markers collected from all scopes.
-        self.keywords: MutableMapping[str, Any] = NodeKeywords(self)
-
-        #: The marker objects belonging to this node.
-        self.own_markers: list[Mark] = []
-
-        #: Allow adding of extra keywords to use for matching.
-        self.extra_keyword_matches: set[str] = set()
-
-        if nodeid is not None:
-            assert "::()" not in nodeid
-            self._nodeid = nodeid
-        else:
-            if not self.parent:
-                raise TypeError("nodeid or parent must be provided")
-            self._nodeid = self.parent.nodeid + "::" + self.name
-
-        #: A place where plugins can store information on the node for their
-        #: own use.
-        self.stash: Stash = Stash()
-        # Deprecated alias. Was never public. Can be removed in a few releases.
-        self._store = self.stash
-
-    @classmethod
-    def from_parent(cls, parent: Node, **kw) -> Self:
-        """Public constructor for Nodes.
-
-        This indirection got introduced in order to enable removing
-        the fragile logic from the node constructors.
-
-        Subclasses can use ``super().from_parent(...)`` when overriding the
-        construction.
-
-        :param parent: The parent node of this Node.
-        """
-        if "config" in kw:
-            raise TypeError("config is not a valid argument for from_parent")
-        if "session" in kw:
-            raise TypeError("session is not a valid argument for from_parent")
-        return cls._create(parent=parent, **kw)
-
-    @property
-    def ihook(self) -> pluggy.HookRelay:
-        """Path-sensitive hook proxy used to call pytest hooks."""
-        return self.session.gethookproxy(self.path)
-
-    def __repr__(self) -> str:
-        return "<{} {}>".format(self.__class__.__name__, getattr(self, "name", None))
-
-    def warn(self, warning: Warning) -> None:
-        """Issue a warning for this Node.
-
-        Warnings will be displayed after the test session, unless explicitly suppressed.
-
-        :param Warning warning:
-            The warning instance to issue.
-
-        :raises ValueError: If ``warning`` instance is not a subclass of Warning.
-
-        Example usage:
-
-        .. code-block:: python
-
-            node.warn(PytestWarning("some message"))
-            node.warn(UserWarning("some message"))
-
-        .. versionchanged:: 6.2
-            Any subclass of :class:`Warning` is now accepted, rather than only
-            :class:`PytestWarning <pytest.PytestWarning>` subclasses.
-        """
-        # enforce type checks here to avoid getting a generic type error later otherwise.
-        if not isinstance(warning, Warning):
-            raise ValueError(
-                f"warning must be an instance of Warning or subclass, got {warning!r}"
-            )
-        path, lineno = get_fslocation_from_item(self)
-        assert lineno is not None
-        warnings.warn_explicit(
-            warning,
-            category=None,
-            filename=str(path),
-            lineno=lineno + 1,
-        )
-
-    # Methods for ordering nodes.
-
-    @property
-    def nodeid(self) -> str:
-        """A ::-separated string denoting its collection tree address."""
-        return self._nodeid
-
-    def __hash__(self) -> int:
-        return hash(self._nodeid)
-
-    def setup(self) -> None:
-        pass
-
-    def teardown(self) -> None:
-        pass
-
-    def iter_parents(self) -> Iterator[Node]:
-        """Iterate over all parent collectors starting from and including self
-        up to the root of the collection tree.
-
-        .. versionadded:: 8.1
-        """
-        parent: Node | None = self
-        while parent is not None:
-            yield parent
-            parent = parent.parent
-
-    def listchain(self) -> list[Node]:
-        """Return a list of all parent collectors starting from the root of the
-        collection tree down to and including self."""
-        chain = []
-        item: Node | None = self
-        while item is not None:
-            chain.append(item)
-            item = item.parent
-        chain.reverse()
-        return chain
-
-    def add_marker(self, marker: str | MarkDecorator, append: bool = True) -> None:
-        """Dynamically add a marker object to the node.
-
-        :param marker:
-            The marker.
-        :param append:
-            Whether to append the marker, or prepend it.
-        """
-        from _pytest.mark import MARK_GEN
-
-        if isinstance(marker, MarkDecorator):
-            marker_ = marker
-        elif isinstance(marker, str):
-            marker_ = getattr(MARK_GEN, marker)
-        else:
-            raise ValueError("is not a string or pytest.mark.* Marker")
-        self.keywords[marker_.name] = marker_
-        if append:
-            self.own_markers.append(marker_.mark)
-        else:
-            self.own_markers.insert(0, marker_.mark)
-
-    def iter_markers(self, name: str | None = None) -> Iterator[Mark]:
-        """Iterate over all markers of the node.
-
-        :param name: If given, filter the results by the name attribute.
-        :returns: An iterator of the markers of the node.
-        """
-        return (x[1] for x in self.iter_markers_with_node(name=name))
-
-    def iter_markers_with_node(
-        self, name: str | None = None
-    ) -> Iterator[tuple[Node, Mark]]:
-        """Iterate over all markers of the node.
-
-        :param name: If given, filter the results by the name attribute.
-        :returns: An iterator of (node, mark) tuples.
-        """
-        for node in self.iter_parents():
-            for mark in node.own_markers:
-                if name is None or getattr(mark, "name", None) == name:
-                    yield node, mark
-
-    @overload
-    def get_closest_marker(self, name: str) -> Mark | None: ...
-
-    @overload
-    def get_closest_marker(self, name: str, default: Mark) -> Mark: ...
-
-    def get_closest_marker(self, name: str, default: Mark | None = None) -> Mark | None:
-        """Return the first marker matching the name, from closest (for
-        example function) to farther level (for example module level).
-
-        :param default: Fallback return value if no marker was found.
-        :param name: Name to filter by.
-        """
-        return next(self.iter_markers(name=name), default)
-
-    def listextrakeywords(self) -> set[str]:
-        """Return a set of all extra keywords in self and any parents."""
-        extra_keywords: set[str] = set()
-        for item in self.listchain():
-            extra_keywords.update(item.extra_keyword_matches)
-        return extra_keywords
-
-    def listnames(self) -> list[str]:
-        return [x.name for x in self.listchain()]
-
-    def addfinalizer(self, fin: Callable[[], object]) -> None:
-        """Register a function to be called without arguments when this node is
-        finalized.
-
-        This method can only be called when this node is active
-        in a setup chain, for example during self.setup().
-        """
-        self.session._setupstate.addfinalizer(fin, self)
-
-    def getparent(self, cls: type[_NodeType]) -> _NodeType | None:
-        """Get the closest parent node (including self) which is an instance of
-        the given class.
-
-        :param cls: The node class to search for.
-        :returns: The node, if found.
-        """
-        for node in self.iter_parents():
-            if isinstance(node, cls):
-                return node
-        return None
-
-    def _traceback_filter(self, excinfo: ExceptionInfo[BaseException]) -> Traceback:
-        return excinfo.traceback
-
-    def _repr_failure_py(
-        self,
-        excinfo: ExceptionInfo[BaseException],
-        style: TracebackStyle | None = None,
-    ) -> TerminalRepr:
-        from _pytest.fixtures import FixtureLookupError
-
-        if isinstance(excinfo.value, ConftestImportFailure):
-            excinfo = ExceptionInfo.from_exception(excinfo.value.cause)
-        if isinstance(excinfo.value, fail.Exception):
-            if not excinfo.value.pytrace:
-                style = "value"
-        if isinstance(excinfo.value, FixtureLookupError):
-            return excinfo.value.formatrepr()
-
-        tbfilter: bool | Callable[[ExceptionInfo[BaseException]], Traceback]
-        if self.config.getoption("fulltrace", False):
-            style = "long"
-            tbfilter = False
-        else:
-            tbfilter = self._traceback_filter
-            if style == "auto":
-                style = "long"
-        # XXX should excinfo.getrepr record all data and toterminal() process it?
-        if style is None:
-            if self.config.getoption("tbstyle", "auto") == "short":
-                style = "short"
-            else:
-                style = "long"
-
-        if self.config.get_verbosity() > 1:
-            truncate_locals = False
-        else:
-            truncate_locals = True
-
-        truncate_args = False if self.config.get_verbosity() > 2 else True
-
-        # excinfo.getrepr() formats paths relative to the CWD if `abspath` is False.
-        # It is possible for a fixture/test to change the CWD while this code runs, which
-        # would then result in the user seeing confusing paths in the failure message.
-        # To fix this, if the CWD changed, always display the full absolute path.
-        # It will be better to just always display paths relative to invocation_dir, but
-        # this requires a lot of plumbing (#6428).
-        try:
-            abspath = Path(os.getcwd()) != self.config.invocation_params.dir
-        except OSError:
-            abspath = True
-
-        return excinfo.getrepr(
-            funcargs=True,
-            abspath=abspath,
-            showlocals=self.config.getoption("showlocals", False),
-            style=style,
-            tbfilter=tbfilter,
-            truncate_locals=truncate_locals,
-            truncate_args=truncate_args,
-        )
-
-    def repr_failure(
-        self,
-        excinfo: ExceptionInfo[BaseException],
-        style: TracebackStyle | None = None,
-    ) -> str | TerminalRepr:
-        """Return a representation of a collection or test failure.
-
-        .. seealso:: :ref:`non-python tests`
-
-        :param excinfo: Exception information for the failure.
-        """
-        return self._repr_failure_py(excinfo, style)
-
-
-def get_fslocation_from_item(node: Node) -> tuple[str | Path, int | None]:
-    """Try to extract the actual location from a node, depending on available attributes:
-
-    * "location": a pair (path, lineno)
-    * "obj": a Python object that the node wraps.
-    * "path": just a path
-
-    :rtype: A tuple of (str|Path, int) with filename and 0-based line number.
-    """
-    # See Item.location.
-    location: tuple[str, int | None, str] | None = getattr(node, "location", None)
-    if location is not None:
-        return location[:2]
-    obj = getattr(node, "obj", None)
-    if obj is not None:
-        return getfslineno(obj)
-    return getattr(node, "path", "unknown location"), -1
-
-
-class Collector(Node, abc.ABC):
-    """Base class of all collectors.
-
-    Collector create children through `collect()` and thus iteratively build
-    the collection tree.
-    """
-
-    class CollectError(Exception):
-        """An error during collection, contains a custom message."""
-
-    @abc.abstractmethod
-    def collect(self) -> Iterable[Item | Collector]:
-        """Collect children (items and collectors) for this collector."""
-        raise NotImplementedError("abstract")
-
-    # TODO: This omits the style= parameter which breaks Liskov Substitution.
-    def repr_failure(  # type: ignore[override]
-        self, excinfo: ExceptionInfo[BaseException]
-    ) -> str | TerminalRepr:
-        """Return a representation of a collection failure.
-
-        :param excinfo: Exception information for the failure.
-        """
-        if isinstance(excinfo.value, self.CollectError) and not self.config.getoption(
-            "fulltrace", False
+    NO: Final[str] = ""
+    SPACE: Final[str] = " "
+    DOUBLESPACE: Final[str] = "  "
+    t = leaf.type
+    p = leaf.parent
+    v = leaf.value
+    if t in ALWAYS_NO_SPACE:
+        return NO
+
+    if t == token.COMMENT:
+        return DOUBLESPACE
+
+    assert p is not None, f"INTERNAL ERROR: hand-made leaf without parent: {leaf!r}"
+    if t == token.COLON and p.type not in {
+        syms.subscript,
+        syms.subscriptlist,
+        syms.sliceop,
+    }:
+        return NO
+
+    if t == token.LBRACE and p.type in (
+        syms.fstring_replacement_field,
+        syms.tstring_replacement_field,
+    ):
+        return NO
+
+    prev = leaf.prev_sibling
+    if not prev:
+        prevp = preceding_leaf(p)
+        if not prevp or prevp.type in OPENING_BRACKETS:
+            return NO
+
+        if t == token.COLON:
+            if prevp.type == token.COLON:
+                return NO
+
+            elif prevp.type != token.COMMA and not complex_subscript:
+                return NO
+
+            return SPACE
+
+        if prevp.type == token.EQUAL:
+            if prevp.parent:
+                if prevp.parent.type in {
+                    syms.arglist,
+                    syms.argument,
+                    syms.parameters,
+                    syms.varargslist,
+                }:
+                    return NO
+
+                elif prevp.parent.type == syms.typedargslist:
+                    # A bit hacky: if the equal sign has whitespace, it means we
+                    # previously found it's a typed argument.  So, we're using
+                    # that, too.
+                    return prevp.prefix
+
+        elif (
+            prevp.type == token.STAR
+            and parent_type(prevp) == syms.star_expr
+            and parent_type(prevp.parent) in (syms.subscriptlist, syms.tname_star)
         ):
-            exc = excinfo.value
-            return str(exc.args[0])
+            # No space between typevar tuples or unpacking them.
+            return NO
 
-        # Respect explicit tbstyle option, but default to "short"
-        # (_repr_failure_py uses "long" with "fulltrace" option always).
-        tbstyle = self.config.getoption("tbstyle", "auto")
-        if tbstyle == "auto":
-            tbstyle = "short"
+        elif prevp.type in VARARGS_SPECIALS:
+            if is_vararg(prevp, within=VARARGS_PARENTS | UNPACKING_PARENTS):
+                return NO
 
-        return self._repr_failure_py(excinfo, style=tbstyle)
+        elif prevp.type == token.COLON:
+            if prevp.parent and prevp.parent.type in {syms.subscript, syms.sliceop}:
+                return SPACE if complex_subscript else NO
 
-    def _traceback_filter(self, excinfo: ExceptionInfo[BaseException]) -> Traceback:
-        if hasattr(self, "path"):
-            traceback = excinfo.traceback
-            ntraceback = traceback.cut(path=self.path)
-            if ntraceback == traceback:
-                ntraceback = ntraceback.cut(excludepath=tracebackcutdir)
-            return ntraceback.filter(excinfo)
-        return excinfo.traceback
+        elif (
+            prevp.parent
+            and prevp.parent.type == syms.factor
+            and prevp.type in MATH_OPERATORS
+        ):
+            return NO
+
+        elif prevp.type == token.AT and p.parent and p.parent.type == syms.decorator:
+            # no space in decorators
+            return NO
+
+    elif prev.type in OPENING_BRACKETS:
+        return NO
+
+    elif prev.type == token.BANG:
+        return NO
+
+    if p.type in {syms.parameters, syms.arglist}:
+        # untyped function signatures or calls
+        if not prev or prev.type != token.COMMA:
+            return NO
+
+    elif p.type == syms.varargslist:
+        # lambdas
+        if prev and prev.type != token.COMMA:
+            return NO
+
+    elif p.type == syms.typedargslist:
+        # typed function signatures
+        if not prev:
+            return NO
+
+        if t == token.EQUAL:
+            if prev.type not in TYPED_NAMES:
+                return NO
+
+        elif prev.type == token.EQUAL:
+            # A bit hacky: if the equal sign has whitespace, it means we
+            # previously found it's a typed argument.  So, we're using that, too.
+            return prev.prefix
+
+        elif prev.type != token.COMMA:
+            return NO
+
+    elif p.type in TYPED_NAMES:
+        # type names
+        if not prev:
+            prevp = preceding_leaf(p)
+            if not prevp or prevp.type != token.COMMA:
+                return NO
+
+    elif p.type == syms.trailer:
+        # attributes and calls
+        if t == token.LPAR or t == token.RPAR:
+            return NO
+
+        if not prev:
+            if t == token.DOT or t == token.LSQB:
+                return NO
+
+        elif prev.type != token.COMMA:
+            return NO
+
+    elif p.type == syms.argument:
+        # single argument
+        if t == token.EQUAL:
+            return NO
+
+        if not prev:
+            prevp = preceding_leaf(p)
+            if not prevp or prevp.type == token.LPAR:
+                return NO
+
+        elif prev.type in {token.EQUAL} | VARARGS_SPECIALS:
+            return NO
+
+    elif p.type == syms.decorator:
+        # decorators
+        return NO
+
+    elif p.type == syms.dotted_name:
+        if prev:
+            return NO
+
+        prevp = preceding_leaf(p)
+        if not prevp or prevp.type == token.AT or prevp.type == token.DOT:
+            return NO
+
+    elif p.type == syms.classdef:
+        if t == token.LPAR:
+            return NO
+
+        if prev and prev.type == token.LPAR:
+            return NO
+
+    elif p.type in {syms.subscript, syms.sliceop}:
+        # indexing
+        if not prev:
+            assert p.parent is not None, "subscripts are always parented"
+            if p.parent.type == syms.subscriptlist:
+                return SPACE
+
+            return NO
+
+        elif t == token.COLONEQUAL or prev.type == token.COLONEQUAL:
+            return SPACE
+
+        elif not complex_subscript:
+            return NO
+
+    elif p.type == syms.atom:
+        if prev and t == token.DOT:
+            # dots, but not the first one.
+            return NO
+
+    elif p.type == syms.dictsetmaker:
+        # dict unpacking
+        if prev and prev.type == token.DOUBLESTAR:
+            return NO
+
+    elif p.type in {syms.factor, syms.star_expr}:
+        # unary ops
+        if not prev:
+            prevp = preceding_leaf(p)
+            if not prevp or prevp.type in OPENING_BRACKETS:
+                return NO
+
+            prevp_parent = prevp.parent
+            assert prevp_parent is not None
+            if prevp.type == token.COLON and prevp_parent.type in {
+                syms.subscript,
+                syms.sliceop,
+            }:
+                return NO
+
+            elif prevp.type == token.EQUAL and prevp_parent.type == syms.argument:
+                return NO
+
+        elif t in {token.NAME, token.NUMBER, token.STRING}:
+            return NO
+
+    elif p.type == syms.import_from:
+        if t == token.DOT:
+            if prev and prev.type == token.DOT:
+                return NO
+
+        elif t == token.NAME:
+            if v == "import":
+                return SPACE
+
+            if prev and prev.type == token.DOT:
+                return NO
+
+    elif p.type == syms.sliceop:
+        return NO
+
+    elif p.type == syms.except_clause:
+        if t == token.STAR:
+            return NO
+
+    if Preview.simplify_power_operator_hugging in mode:
+        # Power operator hugging
+        if t == token.DOUBLESTAR and is_simple_exponentiation(p):
+            return NO
+        prevp = preceding_leaf(leaf)
+        if prevp and prevp.type == token.DOUBLESTAR:
+            if prevp.parent and is_simple_exponentiation(prevp.parent):
+                return NO
+
+    return SPACE
 
 
-@lru_cache(maxsize=1000)
-def _check_initialpaths_for_relpath(
-    initial_paths: frozenset[Path], path: Path
-) -> str | None:
-    if path in initial_paths:
-        return ""
+def make_simple_prefix(nl_count: int, form_feed: bool, empty_line: str = "\n") -> str:
+    """Generate a normalized prefix string."""
+    if form_feed:
+        return (empty_line * (nl_count - 1)) + "\f" + empty_line
+    return empty_line * nl_count
 
-    for parent in path.parents:
-        if parent in initial_paths:
-            return str(path.relative_to(parent))
 
+def preceding_leaf(node: LN | None) -> Leaf | None:
+    """Return the first leaf that precedes `node`, if any."""
+    while node:
+        res = node.prev_sibling
+        if res:
+            if isinstance(res, Leaf):
+                return res
+
+            try:
+                return list(res.leaves())[-1]
+
+            except IndexError:
+                return None
+
+        node = node.parent
     return None
 
 
-class FSCollector(Collector, abc.ABC):
-    """Base class for filesystem collectors."""
-
-    def __init__(
-        self,
-        fspath: None = None,
-        path_or_parent: Path | Node | None = None,
-        path: Path | None = None,
-        name: str | None = None,
-        parent: Node | None = None,
-        config: Config | None = None,
-        session: Session | None = None,
-        nodeid: str | None = None,
-    ) -> None:
-        if path_or_parent:
-            if isinstance(path_or_parent, Node):
-                assert parent is None
-                parent = cast(FSCollector, path_or_parent)
-            elif isinstance(path_or_parent, Path):
-                assert path is None
-                path = path_or_parent
-        assert path is not None
-
-        if name is None:
-            name = path.name
-            if parent is not None and parent.path != path:
-                try:
-                    rel = path.relative_to(parent.path)
-                except ValueError:
-                    pass
-                else:
-                    name = str(rel)
-                name = norm_sep(name)
-        self.path = path
-
-        if session is None:
-            assert parent is not None
-            session = parent.session
-
-        if nodeid is None:
-            try:
-                nodeid = str(self.path.relative_to(session.config.rootpath))
-            except ValueError:
-                nodeid = _check_initialpaths_for_relpath(session._initialpaths, path)
-
-            if nodeid:
-                nodeid = norm_sep(nodeid)
-
-        super().__init__(
-            name=name,
-            parent=parent,
-            config=config,
-            session=session,
-            nodeid=nodeid,
-            path=path,
-        )
-
-    @classmethod
-    def from_parent(
-        cls,
-        parent,
-        *,
-        fspath: None = None,
-        path: Path | None = None,
-        **kw,
-    ) -> Self:
-        """The public constructor."""
-        return super().from_parent(parent=parent, fspath=fspath, path=path, **kw)
+def prev_siblings_are(node: LN | None, tokens: list[NodeType | None]) -> bool:
+    """Return if the `node` and its previous siblings match types against the provided
+    list of tokens; the provided `node`has its type matched against the last element in
+    the list.  `None` can be used as the first element to declare that the start of the
+    list is anchored at the start of its parent's children."""
+    if not tokens:
+        return True
+    if tokens[-1] is None:
+        return node is None
+    if not node:
+        return False
+    if node.type != tokens[-1]:
+        return False
+    return prev_siblings_are(node.prev_sibling, tokens[:-1])
 
 
-class File(FSCollector, abc.ABC):
-    """Base class for collecting tests from a file.
-
-    :ref:`non-python tests`.
+def parent_type(node: LN | None) -> NodeType | None:
     """
-
-
-class Directory(FSCollector, abc.ABC):
-    """Base class for collecting files from a directory.
-
-    A basic directory collector does the following: goes over the files and
-    sub-directories in the directory and creates collectors for them by calling
-    the hooks :hook:`pytest_collect_directory` and :hook:`pytest_collect_file`,
-    after checking that they are not ignored using
-    :hook:`pytest_ignore_collect`.
-
-    The default directory collectors are :class:`~pytest.Dir` and
-    :class:`~pytest.Package`.
-
-    .. versionadded:: 8.0
-
-    :ref:`custom directory collectors`.
+    Returns:
+        @node.parent.type, if @node is not None and has a parent.
+            OR
+        None, otherwise.
     """
+    if node is None or node.parent is None:
+        return None
+
+    return node.parent.type
 
 
-class Item(Node, abc.ABC):
-    """Base class of all test invocation items.
+def child_towards(ancestor: Node, descendant: LN) -> LN | None:
+    """Return the child of `ancestor` that contains `descendant`."""
+    node: LN | None = descendant
+    while node and node.parent != ancestor:
+        node = node.parent
+    return node
 
-    Note that for a single function there might be multiple test invocation items.
+
+def replace_child(old_child: LN, new_child: LN) -> None:
     """
+    Side Effects:
+        * If @old_child.parent is set, replace @old_child with @new_child in
+        @old_child's underlying Node structure.
+            OR
+        * Otherwise, this function does nothing.
+    """
+    parent = old_child.parent
+    if not parent:
+        return
 
-    nextitem = None
+    child_idx = old_child.remove()
+    if child_idx is not None:
+        parent.insert_child(child_idx, new_child)
 
-    def __init__(
-        self,
-        name,
-        parent=None,
-        config: Config | None = None,
-        session: Session | None = None,
-        nodeid: str | None = None,
-        **kw,
-    ) -> None:
-        # The first two arguments are intentionally passed positionally,
-        # to keep plugins who define a node type which inherits from
-        # (pytest.Item, pytest.File) working (see issue #8435).
-        # They can be made kwargs when the deprecation above is done.
-        super().__init__(
-            name,
-            parent,
-            config=config,
-            session=session,
-            nodeid=nodeid,
-            **kw,
+
+def container_of(leaf: Leaf) -> LN:
+    """Return `leaf` or one of its ancestors that is the topmost container of it.
+
+    By "container" we mean a node where `leaf` is the very first child.
+    """
+    same_prefix = leaf.prefix
+    container: LN = leaf
+    while container:
+        parent = container.parent
+        if parent is None:
+            break
+
+        if parent.children[0].prefix != same_prefix:
+            break
+
+        if parent.type == syms.file_input:
+            break
+
+        if parent.prev_sibling is not None and parent.prev_sibling.type in BRACKETS:
+            break
+
+        container = parent
+    return container
+
+
+def first_leaf_of(node: LN) -> Leaf | None:
+    """Returns the first leaf of the node tree."""
+    if isinstance(node, Leaf):
+        return node
+    if node.children:
+        return first_leaf_of(node.children[0])
+    else:
+        return None
+
+
+def is_arith_like(node: LN) -> bool:
+    """Whether node is an arithmetic or a binary arithmetic expression"""
+    return node.type in {
+        syms.arith_expr,
+        syms.shift_expr,
+        syms.xor_expr,
+        syms.and_expr,
+    }
+
+
+def is_simple_exponentiation(node: LN) -> bool:
+    """Whether whitespace around `**` should be removed."""
+
+    def is_simple(node: LN) -> bool:
+        if isinstance(node, Leaf):
+            return node.type in (token.NAME, token.NUMBER, token.DOT, token.DOUBLESTAR)
+        elif node.type == syms.factor:  # unary operators
+            return is_simple(node.children[1])
+        else:
+            return all(is_simple(child) for child in node.children)
+
+    return (
+        node.type == syms.power
+        and len(node.children) >= 3
+        and node.children[-2].type == token.DOUBLESTAR
+        and is_simple(node)
+    )
+
+
+def is_docstring(node: NL) -> bool:
+    if isinstance(node, Leaf):
+        if node.type != token.STRING:
+            return False
+
+        prefix = get_string_prefix(node.value)
+        if set(prefix).intersection("bBfF"):
+            return False
+
+    if (
+        node.parent
+        and node.parent.type == syms.simple_stmt
+        and not node.parent.prev_sibling
+        and node.parent.parent
+        and node.parent.parent.type == syms.file_input
+    ):
+        return True
+
+    if prev_siblings_are(
+        node.parent, [None, token.NEWLINE, token.INDENT, syms.simple_stmt]
+    ):
+        return True
+
+    # Multiline docstring on the same line as the `def`.
+    if prev_siblings_are(node.parent, [syms.parameters, token.COLON, syms.simple_stmt]):
+        # `syms.parameters` is only used in funcdefs and async_funcdefs in the Python
+        # grammar. We're safe to return True without further checks.
+        return True
+
+    return False
+
+
+def is_empty_tuple(node: LN) -> bool:
+    """Return True if `node` holds an empty tuple."""
+    return (
+        node.type == syms.atom
+        and len(node.children) == 2
+        and node.children[0].type == token.LPAR
+        and node.children[1].type == token.RPAR
+    )
+
+
+def is_one_tuple(node: LN) -> bool:
+    """Return True if `node` holds a tuple with one element, with or without parens."""
+    if node.type == syms.atom:
+        gexp = unwrap_singleton_parenthesis(node)
+        if gexp is None or gexp.type != syms.testlist_gexp:
+            return False
+
+        return len(gexp.children) == 2 and gexp.children[1].type == token.COMMA
+
+    return (
+        node.type in IMPLICIT_TUPLE
+        and len(node.children) == 2
+        and node.children[1].type == token.COMMA
+    )
+
+
+def is_tuple(node: LN) -> bool:
+    """Return True if `node` holds a tuple."""
+    if node.type != syms.atom:
+        return False
+    gexp = unwrap_singleton_parenthesis(node)
+    if gexp is None or gexp.type != syms.testlist_gexp:
+        return False
+
+    return True
+
+
+def is_tuple_containing_walrus(node: LN) -> bool:
+    """Return True if `node` holds a tuple that contains a walrus operator."""
+    if node.type != syms.atom:
+        return False
+    gexp = unwrap_singleton_parenthesis(node)
+    if gexp is None or gexp.type != syms.testlist_gexp:
+        return False
+
+    return any(child.type == syms.namedexpr_test for child in gexp.children)
+
+
+def is_tuple_containing_star(node: LN) -> bool:
+    """Return True if `node` holds a tuple that contains a star operator."""
+    if node.type != syms.atom:
+        return False
+    gexp = unwrap_singleton_parenthesis(node)
+    if gexp is None or gexp.type != syms.testlist_gexp:
+        return False
+
+    return any(child.type == syms.star_expr for child in gexp.children)
+
+
+def is_generator(node: LN) -> bool:
+    """Return True if `node` holds a generator."""
+    if node.type != syms.atom:
+        return False
+    gexp = unwrap_singleton_parenthesis(node)
+    if gexp is None or gexp.type != syms.testlist_gexp:
+        return False
+
+    return any(child.type == syms.old_comp_for for child in gexp.children)
+
+
+def is_one_sequence_between(
+    opening: Leaf,
+    closing: Leaf,
+    leaves: list[Leaf],
+    brackets: tuple[int, int] = (token.LPAR, token.RPAR),
+) -> bool:
+    """Return True if content between `opening` and `closing` is a one-sequence."""
+    if (opening.type, closing.type) != brackets:
+        return False
+
+    depth = closing.bracket_depth + 1
+    for _opening_index, leaf in enumerate(leaves):
+        if leaf is opening:
+            break
+
+    else:
+        return False
+
+    commas = 0
+    _opening_index += 1
+    for leaf in leaves[_opening_index:]:
+        if leaf is closing:
+            break
+
+        bracket_depth = leaf.bracket_depth
+        if bracket_depth == depth and leaf.type == token.COMMA:
+            commas += 1
+            if leaf.parent and leaf.parent.type in {
+                syms.arglist,
+                syms.typedargslist,
+            }:
+                commas += 1
+                break
+
+    return commas < 2
+
+
+def is_walrus_assignment(node: LN) -> bool:
+    """Return True iff `node` is of the shape ( test := test )"""
+    inner = unwrap_singleton_parenthesis(node)
+    return inner is not None and inner.type == syms.namedexpr_test
+
+
+def is_simple_decorator_trailer(node: LN, last: bool = False) -> bool:
+    """Return True iff `node` is a trailer valid in a simple decorator"""
+    return node.type == syms.trailer and (
+        (
+            len(node.children) == 2
+            and node.children[0].type == token.DOT
+            and node.children[1].type == token.NAME
         )
-        self._report_sections: list[tuple[str, str, str]] = []
-
-        #: A list of tuples (name, value) that holds user defined properties
-        #: for this test.
-        self.user_properties: list[tuple[str, object]] = []
-
-        self._check_item_and_collector_diamond_inheritance()
-
-    def _check_item_and_collector_diamond_inheritance(self) -> None:
-        """
-        Check if the current type inherits from both File and Collector
-        at the same time, emitting a warning accordingly (#8447).
-        """
-        cls = type(self)
-
-        # We inject an attribute in the type to avoid issuing this warning
-        # for the same class more than once, which is not helpful.
-        # It is a hack, but was deemed acceptable in order to avoid
-        # flooding the user in the common case.
-        attr_name = "_pytest_diamond_inheritance_warning_shown"
-        if getattr(cls, attr_name, False):
-            return
-        setattr(cls, attr_name, True)
-
-        problems = ", ".join(
-            base.__name__ for base in cls.__bases__ if issubclass(base, Collector)
+        # last trailer can be an argument-less parentheses pair
+        or (
+            last
+            and len(node.children) == 2
+            and node.children[0].type == token.LPAR
+            and node.children[1].type == token.RPAR
         )
-        if problems:
-            warnings.warn(
-                f"{cls.__name__} is an Item subclass and should not be a collector, "
-                f"however its bases {problems} are collectors.\n"
-                "Please split the Collectors and the Item into separate node types.\n"
-                "Pytest Doc example: https://docs.pytest.org/en/latest/example/nonpython.html\n"
-                "example pull request on a plugin: https://github.com/asmeurer/pytest-flakes/pull/40/",
-                PytestWarning,
+        # last trailer can be arguments
+        or (
+            last
+            and len(node.children) == 3
+            and node.children[0].type == token.LPAR
+            # and node.children[1].type == syms.argument
+            and node.children[2].type == token.RPAR
+        )
+    )
+
+
+def is_simple_decorator_expression(node: LN) -> bool:
+    """Return True iff `node` could be a 'dotted name' decorator
+
+    This function takes the node of the 'namedexpr_test' of the new decorator
+    grammar and test if it would be valid under the old decorator grammar.
+
+    The old grammar was: decorator: @ dotted_name [arguments] NEWLINE
+    The new grammar is : decorator: @ namedexpr_test NEWLINE
+    """
+    if node.type == token.NAME:
+        return True
+    if node.type == syms.power:
+        if node.children:
+            return (
+                node.children[0].type == token.NAME
+                and all(map(is_simple_decorator_trailer, node.children[1:-1]))
+                and (
+                    len(node.children) < 2
+                    or is_simple_decorator_trailer(node.children[-1], last=True)
+                )
             )
+    return False
 
-    @abc.abstractmethod
-    def runtest(self) -> None:
-        """Run the test case for this item.
 
-        Must be implemented by subclasses.
+def is_yield(node: LN) -> bool:
+    """Return True if `node` holds a `yield` or `yield from` expression."""
+    if node.type == syms.yield_expr:
+        return True
 
-        .. seealso:: :ref:`non-python tests`
-        """
-        raise NotImplementedError("runtest must be implemented by Item subclass")
+    if is_name_token(node) and node.value == "yield":
+        return True
 
-    def add_report_section(self, when: str, key: str, content: str) -> None:
-        """Add a new report section, similar to what's done internally to add
-        stdout and stderr captured output::
+    if node.type != syms.atom:
+        return False
 
-            item.add_report_section("call", "stdout", "report section contents")
+    if len(node.children) != 3:
+        return False
 
-        :param str when:
-            One of the possible capture states, ``"setup"``, ``"call"``, ``"teardown"``.
-        :param str key:
-            Name of the section, can be customized at will. Pytest uses ``"stdout"`` and
-            ``"stderr"`` internally.
-        :param str content:
-            The full contents as a string.
-        """
-        if content:
-            self._report_sections.append((when, key, content))
+    lpar, expr, rpar = node.children
+    if lpar.type == token.LPAR and rpar.type == token.RPAR:
+        return is_yield(expr)
 
-    def reportinfo(self) -> tuple[os.PathLike[str] | str, int | None, str]:
-        """Get location information for this item for test reports.
+    return False
 
-        Returns a tuple with three elements:
 
-        - The path of the test (default ``self.path``)
-        - The 0-based line number of the test (default ``None``)
-        - A name of the test to be shown (default ``""``)
+def is_vararg(leaf: Leaf, within: set[NodeType]) -> bool:
+    """Return True if `leaf` is a star or double star in a vararg or kwarg.
 
-        .. seealso:: :ref:`non-python tests`
-        """
-        return self.path, None, ""
+    If `within` includes VARARGS_PARENTS, this applies to function signatures.
+    If `within` includes UNPACKING_PARENTS, it applies to right hand-side
+    extended iterable unpacking (PEP 3132) and additional unpacking
+    generalizations (PEP 448).
+    """
+    if leaf.type not in VARARGS_SPECIALS or not leaf.parent:
+        return False
 
-    @cached_property
-    def location(self) -> tuple[str, int | None, str]:
-        """
-        Returns a tuple of ``(relfspath, lineno, testname)`` for this item
-        where ``relfspath`` is file path relative to ``config.rootpath``
-        and lineno is a 0-based line number.
-        """
-        location = self.reportinfo()
-        path = absolutepath(location[0])
-        relfspath = self.session._node_location_to_relpath(path)
-        assert type(location[2]) is str
-        return (relfspath, location[1], location[2])
+    p = leaf.parent
+    if p.type == syms.star_expr:
+        # Star expressions are also used as assignment targets in extended
+        # iterable unpacking (PEP 3132).  See what its parent is instead.
+        if not p.parent:
+            return False
+
+        p = p.parent
+
+    return p.type in within
+
+
+def is_fstring(node: Node) -> bool:
+    """Return True if the node is an f-string"""
+    return node.type == syms.fstring
+
+
+def fstring_tstring_to_string(node: Node) -> Leaf:
+    """Converts an fstring or tstring node back to a string node."""
+    string_without_prefix = str(node)[len(node.prefix) :]
+    string_leaf = Leaf(token.STRING, string_without_prefix, prefix=node.prefix)
+    string_leaf.lineno = node.get_lineno() or 0
+    return string_leaf
+
+
+def is_multiline_string(node: LN) -> bool:
+    """Return True if `leaf` is a multiline string that actually spans many lines."""
+    if isinstance(node, Node) and is_fstring(node):
+        leaf = fstring_tstring_to_string(node)
+    elif isinstance(node, Leaf):
+        leaf = node
+    else:
+        return False
+
+    return has_triple_quotes(leaf.value) and "\n" in leaf.value
+
+
+def is_parent_function_or_class(node: Node) -> bool:
+    assert node.type in {syms.suite, syms.simple_stmt}
+    assert node.parent is not None
+    # Note this works for suites / simple_stmts in async def as well
+    return node.parent.type in {syms.funcdef, syms.classdef}
+
+
+def is_stub_suite(node: Node) -> bool:
+    """Return True if `node` is a suite with a stub body."""
+    if node.parent is not None and not is_parent_function_or_class(node):
+        return False
+
+    # If there is a comment, we want to keep it.
+    if node.prefix.strip():
+        return False
+
+    if (
+        len(node.children) != 4
+        or node.children[0].type != token.NEWLINE
+        or node.children[1].type != token.INDENT
+        or node.children[3].type != token.DEDENT
+    ):
+        return False
+
+    if node.children[3].prefix.strip():
+        return False
+
+    return is_stub_body(node.children[2])
+
+
+def is_stub_body(node: LN) -> bool:
+    """Return True if `node` is a simple statement containing an ellipsis."""
+    if not isinstance(node, Node) or node.type != syms.simple_stmt:
+        return False
+
+    if len(node.children) != 2:
+        return False
+
+    child = node.children[0]
+    return (
+        not child.prefix.strip()
+        and child.type == syms.atom
+        and len(child.children) == 3
+        and all(leaf == Leaf(token.DOT, ".") for leaf in child.children)
+    )
+
+
+def is_atom_with_invisible_parens(node: LN) -> bool:
+    """Given a `LN`, determines whether it's an atom `node` with invisible
+    parens. Useful in dedupe-ing and normalizing parens.
+    """
+    if isinstance(node, Leaf) or node.type != syms.atom:
+        return False
+
+    first, last = node.children[0], node.children[-1]
+    return (
+        isinstance(first, Leaf)
+        and first.type == token.LPAR
+        and first.value == ""
+        and isinstance(last, Leaf)
+        and last.type == token.RPAR
+        and last.value == ""
+    )
+
+
+def is_empty_par(leaf: Leaf) -> bool:
+    return is_empty_lpar(leaf) or is_empty_rpar(leaf)
+
+
+def is_empty_lpar(leaf: Leaf) -> bool:
+    return leaf.type == token.LPAR and leaf.value == ""
+
+
+def is_empty_rpar(leaf: Leaf) -> bool:
+    return leaf.type == token.RPAR and leaf.value == ""
+
+
+def is_import(leaf: Leaf) -> bool:
+    """Return True if the given leaf starts an import statement."""
+    p = leaf.parent
+    t = leaf.type
+    v = leaf.value
+    return bool(
+        (t == token.LAZY and p and p.type == syms.lazy_import)
+        or (
+            t == token.NAME
+            and (
+                (v == "import" and p and p.type == syms.import_name)
+                or (v == "from" and p and p.type == syms.import_from)
+            )
+        )
+    )
+
+
+def is_with_or_async_with_stmt(leaf: Leaf) -> bool:
+    """Return True if the given leaf starts a with or async with statement."""
+    return bool(
+        leaf.type == token.NAME
+        and leaf.value == "with"
+        and leaf.parent
+        and leaf.parent.type == syms.with_stmt
+    ) or bool(
+        leaf.type == token.ASYNC
+        and leaf.next_sibling
+        and leaf.next_sibling.type == syms.with_stmt
+    )
+
+
+def is_async_stmt_or_funcdef(leaf: Leaf) -> bool:
+    """Return True if the given leaf starts an async def/for/with statement.
+
+    Note that `async def` can be either an `async_stmt` or `async_funcdef`,
+    the latter is used when it has decorators.
+    """
+    return bool(
+        leaf.type == token.ASYNC
+        and leaf.parent
+        and leaf.parent.type in {syms.async_stmt, syms.async_funcdef}
+    )
+
+
+def is_type_comment(leaf: Leaf, mode: Mode) -> bool:
+    """Return True if the given leaf is a type comment. This function should only
+    be used for general type comments (excluding ignore annotations, which should
+    use `is_type_ignore_comment`). Note that general type comments are no longer
+    used in modern version of Python, this function may be deprecated in the future."""
+    t = leaf.type
+    v = leaf.value
+    return t in {token.COMMENT, STANDALONE_COMMENT} and is_type_comment_string(v, mode)
+
+
+def is_type_comment_string(value: str, mode: Mode) -> bool:
+    return value.startswith("#") and value[1:].lstrip().startswith("type:")
+
+
+def is_type_ignore_comment(leaf: Leaf, mode: Mode) -> bool:
+    """Return True if the given leaf is a type comment with ignore annotation."""
+    t = leaf.type
+    v = leaf.value
+    return t in {token.COMMENT, STANDALONE_COMMENT} and is_type_ignore_comment_string(
+        v, mode
+    )
+
+
+def is_type_ignore_comment_string(value: str, mode: Mode) -> bool:
+    """Return True if the given string match with type comment with
+    ignore annotation."""
+    return is_type_comment_string(value, mode) and value.split(":", 1)[
+        1
+    ].lstrip().startswith("ignore")
+
+
+def wrap_in_parentheses(parent: Node, child: LN, *, visible: bool = True) -> None:
+    """Wrap `child` in parentheses.
+
+    This replaces `child` with an atom holding the parentheses and the old
+    child.  That requires moving the prefix.
+
+    If `visible` is False, the leaves will be valueless (and thus invisible).
+    """
+    lpar = Leaf(token.LPAR, "(" if visible else "")
+    rpar = Leaf(token.RPAR, ")" if visible else "")
+    prefix = child.prefix
+    child.prefix = ""
+    index = child.remove() or 0
+    new_child = Node(syms.atom, [lpar, child, rpar])
+    new_child.prefix = prefix
+    parent.insert_child(index, new_child)
+
+
+def unwrap_singleton_parenthesis(node: LN) -> LN | None:
+    """Returns `wrapped` if `node` is of the shape ( wrapped ).
+
+    Parenthesis can be optional. Returns None otherwise"""
+    if len(node.children) != 3:
+        return None
+
+    lpar, wrapped, rpar = node.children
+    if not (lpar.type == token.LPAR and rpar.type == token.RPAR):
+        return None
+
+    return wrapped
+
+
+def ensure_visible(leaf: Leaf) -> None:
+    """Make sure parentheses are visible.
+
+    They could be invisible as part of some statements (see
+    :func:`normalize_invisible_parens` and :func:`visit_import_from`).
+    """
+    if leaf.type == token.LPAR:
+        leaf.value = "("
+    elif leaf.type == token.RPAR:
+        leaf.value = ")"
+
+
+def is_name_token(nl: NL) -> TypeGuard[Leaf]:
+    return nl.type == token.NAME
+
+
+def is_lpar_token(nl: NL) -> TypeGuard[Leaf]:
+    return nl.type == token.LPAR
+
+
+def is_rpar_token(nl: NL) -> TypeGuard[Leaf]:
+    return nl.type == token.RPAR
+
+
+def is_number_token(nl: NL) -> TypeGuard[Leaf]:
+    return nl.type == token.NUMBER
+
+
+def get_annotation_type(leaf: Leaf) -> Literal["return", "param", None]:
+    """Returns the type of annotation this leaf is part of, if any."""
+    ancestor = leaf.parent
+    while ancestor is not None:
+        if ancestor.prev_sibling and ancestor.prev_sibling.type == token.RARROW:
+            return "return"
+        if ancestor.parent and ancestor.parent.type == syms.tname:
+            return "param"
+        ancestor = ancestor.parent
+    return None
+
+
+def is_part_of_annotation(leaf: Leaf) -> bool:
+    """Returns whether this leaf is part of a type annotation."""
+    assert leaf.parent is not None
+    return get_annotation_type(leaf) is not None
+
+
+def first_leaf(node: LN) -> Leaf | None:
+    """Returns the first leaf of the ancestor node."""
+    if isinstance(node, Leaf):
+        return node
+    elif not node.children:
+        return None
+    else:
+        return first_leaf(node.children[0])
+
+
+def last_leaf(node: LN) -> Leaf | None:
+    """Returns the last leaf of the ancestor node."""
+    if isinstance(node, Leaf):
+        return node
+    elif not node.children:
+        return None
+    else:
+        return last_leaf(node.children[-1])
+
+
+def furthest_ancestor_with_last_leaf(leaf: Leaf) -> LN:
+    """Returns the furthest ancestor that has this leaf node as the last leaf."""
+    node: LN = leaf
+    while node.parent and node.parent.children and node is node.parent.children[-1]:
+        node = node.parent
+    return node
+
+
+def has_sibling_with_type(node: LN, type: int) -> bool:
+    # Check previous siblings
+    sibling = node.prev_sibling
+    while sibling is not None:
+        if sibling.type == type:
+            return True
+        sibling = sibling.prev_sibling
+
+    # Check next siblings
+    sibling = node.next_sibling
+    while sibling is not None:
+        if sibling.type == type:
+            return True
+        sibling = sibling.next_sibling
+
+    return False
